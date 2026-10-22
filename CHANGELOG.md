@@ -1,6 +1,29 @@
 # Changelog
 
-## 0.3.0-alpha.1 — Opt-in community contributions (development)
+## 0.4.0-alpha.1 — Key rotation and intake retention (development)
+
+### Added
+- SQLite schema v3: contributor identities, key rotation intents, payload_status
+  and tombstone_receipt columns for submissions/publications.
+- Key rotation: community admin rotates a contributor's key while preserving
+  identity and submission ownership; old keys revoked atomically.
+- Intake purge: manual or retention-based purge of rejected/withdrawn payloads
+  with tombstone receipts to preserve idempotency and final status visibility.
+- `HSD_RETENTION_DAYS` environment variable for automatic sweep on read.
+- API endpoints: `/api/community/rotate`, `/api/community/purge`,
+  `/api/community/retention`.
+- Migration v2→v3 preserves existing submissions, keys and publications.
+
+### Changed
+- `authenticate` returns `{ keyId, contributorId }`; `receive` and `status` use
+  contributor identity for scoping instead of raw key ID.
+- `issueKey` returns `{ id, secret, contributorId }`.
+- Submissions keyed by `(contributor_id, client_id)` instead of `(key_id, client_id)`.
+
+### Limits
+Retention default is 0 (manual). Purge only affects rejected/withdrawn submissions;
+published/withdrawn public snapshots remain until explicitly withdrawn. Tombstones
+preserve final receipt for contributor retry. No automatic background sweep timer.
 
 ### Added
 - SQLite schema v2: peer connectors, frozen outbox packages, revocable contributor

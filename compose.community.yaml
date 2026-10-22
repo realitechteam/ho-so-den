@@ -6,7 +6,7 @@ services:
       HSD_ALLOW_HTTP_PEERS: http://community:8080
   community:
     build: .
-    image: ho-so-den:0.3.0-alpha.1
+    image: ho-so-den:0.4.0-alpha.1
     environment:
       HSD_MODE: community
       HSD_INTAKE_HOSTS: community:8080

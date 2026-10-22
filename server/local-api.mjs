@@ -30,7 +30,7 @@ const credentials = input => {
 export async function createLocalApi({ dataDirectory, origin, mode = 'local', allowHttpPeers = [], intakeHosts = [] } = {}) {
   if (!['local', 'community'].includes(mode)) throw new Error('HSD_MODE must be local or community.');
   const store = await openStore(dataDirectory);
-  const contributions = createContributions(store, { mode, allowHttpPeers });
+  const contributions = createContributions(store, { mode, allowHttpPeers, retentionDays: Number(process.env.HSD_RETENTION_DAYS || 0) });
   const cookieName = `hsd_${store.db.prepare("SELECT value FROM instance_meta WHERE key='cookie_namespace'").get().value}`;
   let queue = Promise.resolve();
   const serial = fn => { const result = queue.then(fn); queue = result.catch(() => {}); return result; };
@@ -92,13 +92,12 @@ export async function createLocalApi({ dataDirectory, origin, mode = 'local', al
         response.setHeader('Cache-Control', 'no-store');
         const method = request.method;
         if (intake) {
-          contributions.authenticate(request.headers.authorization);
+          const auth = contributions.authenticate(request.headers.authorization);
           const input = path === '/api/intake' && method === 'POST' ? await jsonBody(request, contributionLimits.wireBytes) : undefined;
           await serial(() => {
-            const keyId = contributions.authenticate(request.headers.authorization);
-            if (path === '/api/intake' && method === 'POST') { send(response, 200, contributions.receive(keyId, input)); return; }
+            if (path === '/api/intake' && method === 'POST') { send(response, 200, contributions.receive(auth, input)); return; }
             const match = path.match(/^\/api\/intake\/([a-f\d-]{36})$/);
-            if (match && method === 'GET') { send(response, 200, contributions.status(keyId, match[1])); return; }
+            if (match && method === 'GET') { send(response, 200, contributions.status(auth, match[1])); return; }
             fail(404, 'Không có endpoint tiếp nhận này.');
           }); return true;
         }
@@ -167,6 +166,9 @@ export async function createLocalApi({ dataDirectory, origin, mode = 'local', al
           }
           const keyMatch = path.match(/^\/api\/community\/keys\/([a-f\d-]{36})$/);
           if (keyMatch && method === 'DELETE') { send(response, 200, contributions.revokeKey(keyMatch[1])); return; }
+          if (path === '/api/community/rotate' && method === 'POST') { send(response, 200, contributions.rotateKey(await jsonBody(request))); return; }
+          if (path === '/api/community/retention' && method === 'GET') { send(response, 200, { retentionDays: contributions.retentionDays() }); return; }
+          if (path === '/api/community/purge' && method === 'POST') { send(response, 200, contributions.purge(await jsonBody(request))); return; }
           if (path === '/api/community/submissions' && method === 'GET') { send(response, 200, { submissions: contributions.queue() }); return; }
           const reviewMatch = path.match(/^\/api\/community\/submissions\/([a-f\d-]{36})(?:\/(decision|files)(?:\/([a-f\d-]{36}))?)?$/);
           if (reviewMatch) {

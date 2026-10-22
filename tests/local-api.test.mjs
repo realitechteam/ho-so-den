@@ -155,9 +155,9 @@ test('schema v1 upgrades to v2 without changing existing records, versions or bl
   const row = store.create(sample);
   const file = await store.attach(row.id, 'migration.txt', Buffer.from('preserve these bytes'));
   const before = store.detail(row.id);
-  store.db.exec('DROP TABLE publications; DROP TABLE submission_events; DROP TABLE submissions; DROP TABLE outbox; DROP TABLE connectors; DROP TABLE contribution_keys; DROP TABLE instance_meta; PRAGMA user_version=1;');
+  store.db.exec('DROP TABLE publications; DROP TABLE submission_events; DROP TABLE submissions; DROP TABLE outbox; DROP TABLE connectors; DROP TABLE contribution_keys; DROP TABLE key_rotation_intents; DROP TABLE contributors; DROP TABLE instance_meta; PRAGMA user_version=1;');
   store.close(); store = await openStore(directory);
-  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 2);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 3);
   assert.deepEqual(store.detail(row.id), before);
   assert.equal((await store.download(file.id)).bytes.toString(), 'preserve these bytes');
   assert.equal(store.db.prepare("SELECT value FROM instance_meta WHERE key='cookie_namespace'").get().value.length, 16);

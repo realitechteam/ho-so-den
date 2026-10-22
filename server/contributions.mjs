@@ -4,6 +4,7 @@ import { digest, fail, uuid, validateRecord } from './store.mjs';
 
 export const contributionLimits = { wireBytes: 32 * 1024 * 1024, mediaBytes: 20 * 1024 * 1024, files: 50, retainedBytes: 256 * 1024 * 1024 };
 const states = ['submitted', 'changes_requested', 'rejected', 'approved', 'published', 'withdrawn'];
+const purgeable = new Set(['rejected', 'withdrawn']);
 const now = () => new Date().toISOString();
 const string = (value, max, name, required = false) => {
   if (typeof value !== 'string' || value.length > max || value.includes('\0') || (required && !value.trim())) fail(400, `${name} không hợp lệ.`);
@@ -46,8 +47,13 @@ function normalizePacket(input) {
     record: publicRecord(input.record), files, credit: string(input.credit, 200, 'Tên ghi nhận'), rights: string(input.rights, 2000, 'Quyền công bố', true) };
 }
 const redactPacket = packet => ({ ...packet, files: packet.files.map(({ data, ...file }) => file) });
-
-export function createContributions(store, { mode = 'local', allowHttpPeers = [] } = {}) {
+const asDate = value => typeof value === 'string' && Number.isFinite(Date.parse(value));
+function normalizedReceipt(value, row) {
+  if (!value || !uuid(value.id) || value.clientId !== row.id || value.hash !== row.payload_hash || !states.includes(value.status) || typeof value.feedback !== 'string' || value.feedback.length > 2000 || !asDate(value.updatedAt)) fail(502, 'Biên nhận không khớp gói đã gửi.');
+  if (value.publicPath !== null && (value.status !== 'published' || !/^\/community\.html#publication\/[a-f\d-]{36}$/.test(value.publicPath))) fail(502, 'Liên kết công bố không hợp lệ.');
+  return { id: value.id, clientId: value.clientId, hash: value.hash, status: value.status, feedback: value.feedback, updatedAt: value.updatedAt, publicPath: value.publicPath };
+}
+export function createContributions(store, { mode = 'local', allowHttpPeers = [], retentionDays = 0 } = {}) {
   const db = store.db;
   const guard = expected => { if (mode !== expected) fail(404, 'Chức năng không có trong chế độ instance này.'); };
   const transaction = fn => { db.exec('BEGIN IMMEDIATE'); try { const value = fn(); db.exec('COMMIT'); return value; } catch (error) { db.exec('ROLLBACK'); throw error; } };
@@ -56,16 +62,38 @@ export function createContributions(store, { mode = 'local', allowHttpPeers = []
     if (!row) fail(404, 'Chưa cấu hình kết nối này.');
     return row;
   };
+  const contributor = id => {
+    const row = db.prepare('SELECT * FROM contributors WHERE id=?').get(id);
+    if (!row) fail(404, 'Không tìm thấy contributor.');
+    return row;
+  };
+  const contributorKey = id => {
+    const row = db.prepare('SELECT * FROM contribution_keys WHERE id=?').get(id);
+    if (!row) fail(404, 'Không tìm thấy khóa.');
+    return row;
+  };
   const submission = id => {
     const row = db.prepare('SELECT * FROM submissions WHERE id=?').get(id);
     if (!row) fail(404, 'Không tìm thấy đóng góp.');
     return row;
   };
-  const receipt = row => {
-    const publication = db.prepare('SELECT id FROM publications WHERE submission_id=? AND withdrawn_at IS NULL').get(row.id);
-    return { id: row.id, clientId: row.client_id, hash: row.payload_hash, status: row.status, feedback: row.feedback,
-      updatedAt: row.updated_at, publicPath: publication && row.status === 'published' ? `/community.html#publication/${publication.id}` : null };
+  const activeKey = tokenHash => {
+    const row = db.prepare('SELECT * FROM contribution_keys WHERE token_hash=? AND revoked=0').get(tokenHash);
+    if (!row) fail(401, 'Khóa đóng góp không hợp lệ hoặc đã thu hồi.');
+    return row;
   };
+  const latestReceipt = row => {
+    if (row.status === 'published') {
+      const pub = db.prepare('SELECT id FROM publications WHERE submission_id=? AND withdrawn_at IS NULL').get(row.id);
+      return { id: row.id, clientId: row.client_id, hash: row.payload_hash, status: row.status, feedback: row.feedback, updatedAt: row.updated_at, publicPath: pub ? `/community.html#publication/${pub.id}` : null };
+    }
+    if (row.status === 'withdrawn' || row.status === 'rejected') {
+      return { id: row.id, clientId: row.client_id, hash: row.payload_hash, status: row.status, feedback: row.feedback, updatedAt: row.updated_at, publicPath: null };
+    }
+    if (row.tombstone_receipt) return JSON.parse(row.tombstone_receipt);
+    return { id: row.id, clientId: row.client_id, hash: row.payload_hash, status: row.status, feedback: row.feedback, updatedAt: row.updated_at, publicPath: null };
+  };
+  const receipt = row => latestReceipt(row);
   const viewOutbox = row => {
     const packet = JSON.parse(row.payload), target = connector(row.connector_id), remote = row.receipt ? JSON.parse(row.receipt) : null;
     return { id: row.id, recordId: row.record_id, title: packet.record.title, connectorId: row.connector_id, target: target.origin,
@@ -73,6 +101,23 @@ export function createContributions(store, { mode = 'local', allowHttpPeers = []
       publicUrl: remote?.publicPath ? `${target.public_origin}${remote.publicPath}` : null };
   };
   const outbox = id => { const row = db.prepare('SELECT * FROM outbox WHERE id=?').get(id); if (!row) fail(404, 'Không tìm thấy gói đã chọn.'); return row; };
+  function shouldPurge(row) {
+    if (!purgeable.has(row.status)) return false;
+    if (retentionDays <= 0) return false;
+    const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
+    return Date.parse(row.updated_at) <= cutoff;
+  }
+  function purgePacket(row) {
+    if (row.payload_status === 'purged') return row;
+    const packet = JSON.parse(row.payload);
+    const tombstone = JSON.stringify({ ...latestReceipt(row), purgedAt: now() });
+    db.prepare('UPDATE submissions SET payload=?,payload_status=?,tombstone_receipt=? WHERE id=?').run(JSON.stringify({ format: 'ho-so-den.contribution', version: 1, id: packet.id, createdAt: packet.createdAt, sourceRevision: packet.sourceRevision, record: { title: packet.record.title, summary: '', body: '', category: packet.record.category, sources: [] }, files: [], credit: '', rights: 'Payload removed by retention purge.' }), 'purged', tombstone, row.id);
+    db.prepare('INSERT INTO submission_events(submission_id,status,feedback,created_at) VALUES (?,?,?,?)').run(row.id, row.status, 'Payload purged by retention policy.', now());
+    return submission(row.id);
+  }
+  function retentionSweep() {
+    for (const row of db.prepare('SELECT * FROM submissions').all()) if (shouldPurge(row)) purgePacket(row);
+  }
   const peerURL = value => {
     const url = originURL(value);
     if (url.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) && !allowHttpPeers.includes(url.origin)) fail(400, 'HTTP chỉ dùng cho loopback hoặc peer được operator cho phép; dùng HTTPS cho Internet.');
@@ -91,9 +136,7 @@ export function createContributions(store, { mode = 'local', allowHttpPeers = []
     } catch (error) { if (error.status) throw error; fail(502, 'Chưa xác nhận được kết quả từ máy nhận. Có thể thử lại cùng gói, không tạo gói mới.'); }
   }
   function checkReceipt(value, row) {
-    if (!value || !uuid(value.id) || value.clientId !== row.id || value.hash !== row.payload_hash || !states.includes(value.status) || typeof value.feedback !== 'string' || value.feedback.length > 2000 || typeof value.updatedAt !== 'string' || !Number.isFinite(Date.parse(value.updatedAt))) fail(502, 'Biên nhận không khớp gói đã gửi.');
-    if (value.publicPath !== null && (value.status !== 'published' || !/^\/community\.html#publication\/[a-f\d-]{36}$/.test(value.publicPath))) fail(502, 'Liên kết công bố không hợp lệ.');
-    return { id: value.id, clientId: value.clientId, hash: value.hash, status: value.status, feedback: value.feedback, updatedAt: value.updatedAt, publicPath: value.publicPath };
+    return normalizedReceipt(value, row);
   }
   return {
     mode,
@@ -155,57 +198,84 @@ export function createContributions(store, { mode = 'local', allowHttpPeers = []
       db.prepare('UPDATE outbox SET receipt=?,updated_at=? WHERE id=?').run(JSON.stringify(value), now(), id);
       return viewOutbox(outbox(id));
     },
-    keys() { guard('community'); return db.prepare('SELECT id,label,revoked,created_at FROM contribution_keys ORDER BY created_at').all(); },
+    rotateKey(input) {
+      guard('community'); keys(input, ['contributorId', 'label', 'origin']);
+      const current = contributor(input.contributorId);
+      const url = peerURL(input.origin);
+      const label = string(input.label, 100, 'Tên người gửi', true);
+      const secret = randomBytes(32).toString('hex'), keyId = randomUUID(), time = now();
+      const oldKeys = db.prepare('SELECT * FROM contribution_keys WHERE contributor_id=? AND revoked=0').all(current.id);
+      const packet = JSON.stringify({ format: 'ho-so-den.contribution', version: 1, id: randomUUID(), createdAt: time, sourceRevision: 0, record: { title: label, summary: '', body: '', category: 'Key rotation', sources: [] }, files: [], credit: label, rights: 'Rotation request' });
+      transaction(() => {
+        for (const key of oldKeys) db.prepare('UPDATE contribution_keys SET revoked=1 WHERE id=?').run(key.id);
+        db.prepare('INSERT INTO contribution_keys VALUES (?,?,?,?,?,?)').run(keyId, label, digest(secret), 0, time, current.id);
+        db.prepare('INSERT INTO key_rotation_intents VALUES (?,?,?,?,?,NULL)').run(randomUUID(), current.id, url.origin, time);
+      });
+      return { contributorId: current.id, keyId, secret, packet };
+    },
+    retentionDays() { guard('community'); return retentionDays; },
+    keys() { guard('community'); retentionSweep(); return db.prepare('SELECT id,label,revoked,created_at,contributor_id FROM contribution_keys ORDER BY created_at').all(); },
     issueKey(input) {
       guard('community'); const secret = randomBytes(32).toString('hex'), id = randomUUID();
-      db.prepare('INSERT INTO contribution_keys VALUES (?,?,?,0,?)').run(id, string(input?.label, 100, 'Tên người gửi', true), digest(secret), now());
-      return { id, secret };
+      const contributorId = randomUUID();
+      db.prepare('INSERT INTO contributors VALUES (?,?,?)').run(contributorId, string(input?.label, 100, 'Tên người gửi', true), now());
+      db.prepare('INSERT INTO contribution_keys VALUES (?,?,?,0,?,?)').run(id, string(input?.label, 100, 'Tên người gửi', true), digest(secret), now(), contributorId);
+      return { id, secret, contributorId };
     },
-    revokeKey(id) { guard('community'); db.prepare('UPDATE contribution_keys SET revoked=1 WHERE id=?').run(id); return { ok: true }; },
+    revokeKey(id) { guard('community'); contributorKey(id); db.prepare('UPDATE contribution_keys SET revoked=1 WHERE id=?').run(id); return { ok: true }; },
     authenticate(header) {
       guard('community'); const match = typeof header === 'string' && header.match(/^Bearer ([a-f\d]{64})$/);
-      const key = match && db.prepare('SELECT id FROM contribution_keys WHERE token_hash=? AND revoked=0').get(digest(match[1]));
-      if (!key) fail(401, 'Khóa đóng góp không hợp lệ hoặc đã thu hồi.');
-      return key.id;
+      if (!match) fail(401, 'Khóa đóng góp không hợp lệ hoặc đã thu hồi.');
+      const row = activeKey(digest(match[1]));
+      return { keyId: row.id, contributorId: row.contributor_id };
     },
-    receive(keyId, input) {
-      guard('community');
-      if (!db.prepare('SELECT 1 FROM contribution_keys WHERE id=? AND revoked=0').get(keyId)) fail(401, 'Khóa đã bị thu hồi.');
+    receive(auth, input) {
+      guard('community'); retentionSweep();
       const packet = normalizePacket(input), payload = JSON.stringify(packet), hash = digest(payload);
-      const prior = db.prepare('SELECT * FROM submissions WHERE key_id=? AND client_id=?').get(keyId, packet.id);
-      if (prior) { if (prior.payload_hash !== hash) fail(409, 'Submission ID đã tồn tại với nội dung khác.'); return receipt(prior); }
+      const existing = db.prepare('SELECT * FROM submissions WHERE contributor_id=? AND client_id=?').get(auth.contributorId, packet.id);
+      if (existing) {
+        if (existing.payload_hash !== hash) fail(409, 'Submission ID đã tồn tại với nội dung khác.');
+        if (existing.payload_status === 'purged') return { ...latestReceipt(existing), purged: true };
+        return receipt(existing);
+      }
       const retained = db.prepare('SELECT coalesce(sum(length(CAST(payload AS BLOB))),0) AS size FROM submissions').get().size;
       if (retained + Buffer.byteLength(payload) > contributionLimits.retainedBytes) fail(413, 'Hàng đợi chạm giới hạn lưu trữ alpha.');
-      if (db.prepare('SELECT count(*) AS n FROM submissions WHERE key_id=?').get(keyId).n >= 50) fail(429, 'Khóa đã đạt giới hạn 50 gói của bản alpha.');
+      if (db.prepare('SELECT count(*) AS n FROM submissions WHERE contributor_id=?').get(auth.contributorId).n >= 50) fail(429, 'Khóa đã đạt giới hạn 50 gói của bản alpha.');
       return transaction(() => {
         const id = randomUUID(), time = now();
-        db.prepare('INSERT INTO submissions VALUES (?,?,?,?,?,?,1,NULL,?,?,?)').run(id, keyId, packet.id, payload, hash, 'submitted', '', time, time);
-        db.prepare('INSERT INTO submission_events(submission_id,status,feedback,created_at) VALUES (?,?,?,?)').run(id, 'submitted', '', time);
+        db.prepare('INSERT INTO submissions (id,key_id,contributor_id,client_id,payload,payload_hash,status,revision,review,feedback,created_at,updated_at,payload_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(id, auth.keyId, auth.contributorId, packet.id, payload, hash, 'submitted', 1, null, '', time, time, 'retained');
+        db.prepare('INSERT INTO submission_events (submission_id,status,feedback,created_at) VALUES (?,?,?,?)').run(id, 'submitted', '', time);
         return receipt(submission(id));
       });
     },
-    status(keyId, id) {
-      guard('community'); const row = db.prepare('SELECT * FROM submissions WHERE id=? AND key_id=?').get(id, keyId);
+    status(auth, id) {
+      guard('community'); retentionSweep();
+      const row = db.prepare('SELECT * FROM submissions WHERE id=? AND contributor_id=?').get(id, auth.contributorId);
       if (!row) fail(404, 'Không tìm thấy đóng góp thuộc khóa này.');
+      if (row.payload_status === 'purged') return { ...latestReceipt(row), purged: true };
       return receipt(row);
     },
     queue() {
-      guard('community'); return db.prepare('SELECT * FROM submissions ORDER BY created_at DESC').all().map(row => ({ id: row.id, title: JSON.parse(row.payload).record.title, status: row.status, revision: row.revision, createdAt: row.created_at }));
+      guard('community'); retentionSweep();
+      return db.prepare('SELECT * FROM submissions ORDER BY created_at DESC').all().map(row => ({ id: row.id, title: JSON.parse(row.payload).record.title, status: row.status, revision: row.revision, createdAt: row.created_at, payloadStatus: row.payload_status }));
     },
     review(id) {
-      guard('community'); const row = submission(id);
-      return { id: row.id, status: row.status, revision: row.revision, hash: row.payload_hash, packet: redactPacket(JSON.parse(row.payload)), publication: row.review ? JSON.parse(row.review) : null,
-        feedback: row.feedback, events: db.prepare('SELECT status,feedback,created_at FROM submission_events WHERE submission_id=? ORDER BY id').all(id) };
+      guard('community'); retentionSweep(); const row = submission(id);
+      return { id: row.id, status: row.status, revision: row.revision, hash: row.payload_hash, packet: row.payload_status === 'purged' ? redactPacket(JSON.parse(row.payload)) : redactPacket(JSON.parse(row.payload)), publication: row.review ? JSON.parse(row.review) : null,
+        feedback: row.feedback, payloadStatus: row.payload_status, events: db.prepare('SELECT status,feedback,created_at FROM submission_events WHERE submission_id=? ORDER BY id').all(id) };
     },
     privateFile(id, fileId) {
-      guard('community'); const packet = JSON.parse(submission(id).payload), file = packet.files.find(file => file.id === fileId);
+      guard('community'); retentionSweep(); const row = submission(id);
+      if (row.payload_status === 'purged') fail(410, 'Payload đã bị purge.');
+      const packet = JSON.parse(row.payload), file = packet.files.find(file => file.id === fileId);
       if (!file) fail(404, 'Không có tệp này.'); return { name: file.name, bytes: Buffer.from(file.data, 'base64') };
     },
     decide(id, input) {
-      guard('community'); const row = submission(id);
+      guard('community'); retentionSweep(); const row = submission(id);
       if (input?.revision !== row.revision) fail(409, 'Hàng đợi đã thay đổi. Tải lại trước khi duyệt.');
       const transitions = { submitted: ['approved', 'changes_requested', 'rejected'], changes_requested: ['approved', 'rejected'], approved: ['published', 'changes_requested', 'rejected'], published: ['withdrawn'] };
       if (!transitions[row.status]?.includes(input.status)) fail(409, 'Chuyển trạng thái không hợp lệ.');
+      if (row.payload_status === 'purged' && input.status !== 'published' && input.status !== 'withdrawn') fail(410, 'Payload đã bị purge.');
       const feedback = string(input.feedback, 2000, 'Lý do (người gửi nhìn thấy)', true);
       const packet = JSON.parse(row.payload); let review = row.review;
       if (input.status === 'approved') {
@@ -217,15 +287,24 @@ export function createContributions(store, { mode = 'local', allowHttpPeers = []
       if (input.status === 'published' && input.confirm !== true) fail(400, 'Cần xác nhận công bố công khai bản đã duyệt.');
       return transaction(() => {
         if (input.status === 'published') {
+          if (row.payload_status === 'purged') fail(410, 'Payload đã bị purge.');
           const approved = JSON.parse(review);
           const content = { record: approved.record, credit: approved.credit, files: packet.files.filter(file => approved.fileIds.includes(file.id)) };
-          db.prepare('INSERT INTO publications VALUES (?,?,?,?,NULL)').run(randomUUID(), id, JSON.stringify(content), now());
+          db.prepare('INSERT INTO publications (id,submission_id,content,created_at,withdrawn_at,payload_status) VALUES (?,?,?,?,NULL,?)').run(randomUUID(), id, JSON.stringify(content), now(), row.payload_status);
         }
         if (input.status === 'withdrawn') db.prepare('UPDATE publications SET withdrawn_at=? WHERE submission_id=?').run(now(), id);
         db.prepare('UPDATE submissions SET status=?,revision=revision+1,review=?,feedback=?,updated_at=? WHERE id=?').run(input.status, review, feedback, now(), id);
         db.prepare('INSERT INTO submission_events(submission_id,status,feedback,created_at) VALUES (?,?,?,?)').run(id, input.status, feedback, now());
         return this.review(id);
       });
+    },
+    purge(input) {
+      guard('community'); keys(input, ['id']);
+      const row = submission(input.id);
+      if (!purgeable.has(row.status)) fail(409, 'Chỉ purge khi gói đã kết thúc.');
+      if (row.payload_status === 'purged') return { id: row.id, purged: true };
+      purgePacket(row);
+      return { id: row.id, purged: true };
     },
     publicList() {
       guard('community'); return db.prepare('SELECT id,content,created_at FROM publications WHERE withdrawn_at IS NULL ORDER BY created_at DESC').all().map(row => ({ id: row.id, title: JSON.parse(row.content).record.title, createdAt: row.created_at }));

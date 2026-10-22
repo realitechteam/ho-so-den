@@ -44,7 +44,7 @@ export async function openStore(dataDirectory) {
   const db = new DatabaseSync(join(root, 'archive.sqlite'), { timeout: 5000 });
   db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
   const schema = db.prepare('PRAGMA user_version').get().user_version;
-  if (schema > 2) { db.close(); fail(500, 'Database mới hơn phiên bản phần mềm này.'); }
+  if (schema > 3) { db.close(); fail(500, 'Database mới hơn phiên bản phần mềm này.'); }
   if (schema === 0) db.exec(`
     BEGIN;
     CREATE TABLE admin (id INTEGER PRIMARY KEY CHECK(id=1), username TEXT NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL) STRICT;
@@ -82,6 +82,30 @@ export async function openStore(dataDirectory) {
     PRAGMA user_version=2;
     COMMIT;
   `);
+  if (schema < 3) {
+    db.exec(`
+    CREATE TABLE IF NOT EXISTS contributors (id TEXT PRIMARY KEY, label TEXT NOT NULL, created_at TEXT NOT NULL) STRICT;
+    CREATE TABLE IF NOT EXISTS key_rotation_intents (id TEXT PRIMARY KEY, contributor_id TEXT NOT NULL REFERENCES contributors(id) ON DELETE CASCADE,
+      origin TEXT NOT NULL, created_at TEXT NOT NULL, claimed_at TEXT) STRICT;
+    `);
+    const columns = db.prepare("SELECT name FROM pragma_table_info('contribution_keys')").all().map(r => r.name);
+    if (!columns.includes('contributor_id')) db.exec('ALTER TABLE contribution_keys ADD COLUMN contributor_id TEXT REFERENCES contributors(id) ON DELETE CASCADE');
+    const subCols = db.prepare("SELECT name FROM pragma_table_info('submissions')").all().map(r => r.name);
+    if (!subCols.includes('contributor_id')) db.exec('ALTER TABLE submissions ADD COLUMN contributor_id TEXT REFERENCES contributors(id) ON DELETE CASCADE');
+    if (!subCols.includes('payload_status')) db.exec('ALTER TABLE submissions ADD COLUMN payload_status TEXT');
+    if (!subCols.includes('tombstone_receipt')) db.exec('ALTER TABLE submissions ADD COLUMN tombstone_receipt TEXT');
+    const eventCols = db.prepare("SELECT name FROM pragma_table_info('submission_events')").all().map(r => r.name);
+    if (!eventCols.includes('payload_status')) db.exec('ALTER TABLE submission_events ADD COLUMN payload_status TEXT');
+    const pubCols = db.prepare("SELECT name FROM pragma_table_info('publications')").all().map(r => r.name);
+    if (!pubCols.includes('payload_status')) db.exec('ALTER TABLE publications ADD COLUMN payload_status TEXT');
+    db.exec(`
+    UPDATE submissions SET payload_status='retained' WHERE payload_status IS NULL;
+    UPDATE submissions SET contributor_id=(SELECT contributor_id FROM contribution_keys WHERE contribution_keys.id=submissions.key_id) WHERE contributor_id IS NULL AND EXISTS (SELECT 1 FROM contribution_keys WHERE contribution_keys.contributor_id IS NOT NULL);
+    CREATE INDEX IF NOT EXISTS submissions_contributor ON submissions(contributor_id);
+    CREATE INDEX IF NOT EXISTS key_rotation_intents_contributor ON key_rotation_intents(contributor_id);
+    PRAGMA user_version=3;
+    `);
+  }
   const transaction = fn => {
     db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); db.exec('COMMIT'); return result; }

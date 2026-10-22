@@ -1,6 +1,6 @@
 {
   "name": "ho-so-den",
-  "version": "0.3.0-alpha.1",
+  "version": "0.4.0-alpha.1",
   "private": true,
   "description": "Open-source local-first case archive with opt-in contribution packages and private community review (alpha).",
   "license": "AGPL-3.0-only",

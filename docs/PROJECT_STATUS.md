@@ -9,9 +9,9 @@ và phát hành. Không lấy riêng version string hoặc dấu checkbox làm b
 - Repository chính: https://github.com/phoenixvn/ho-so-den
 - Maintainer: `@phoenixvn`; giấy phép source/docs/fixture: `AGPL-3.0-only`.
 - Nhánh tích hợp: `main`.
-- Phiên bản phát triển trong mã: **`0.3.0-alpha.1`**.
+- Phiên bản phát triển trong mã: **`0.4.0-alpha.1`**.
 - Maturity: **local + community alpha, một admin mỗi instance**.
-- SQLite schema: **v2**. Portable archive format: **v1**. Contribution protocol: **v1**.
+- SQLite schema: **v3**. Portable archive format: **v1**. Contribution protocol: **v1**.
 - Các release đã được xác nhận trước checkpoint này: `v0.1.0-alpha.1` và
   `v0.1.0-alpha.2` (design preview). Chưa tạo tag/release `0.2` hoặc `0.3`.
 - Preview public: https://phoenixvn.github.io/ho-so-den/ — chỉ `dist/`, không có API,
@@ -139,7 +139,8 @@ Không tự xóa volume hoặc sử dụng `down -v` trên instance không phả
 - Tệp local 25 MiB. Portable backup: 100 MiB JSON, 60 MiB tư liệu, 10.000 mục/loại.
 - Contribution: 20 MiB tư liệu, 50 tệp, 32 MiB wire JSON; outbox/intake mỗi bên 256 MiB
   retained payload; tối đa 50 gói/receiver key.
-- Chưa upload resume/chunk, rotation key giữ identity, retention/purge với tombstones.
+- Chưa upload resume/chunk, ~~rotation key giữ identity, retention/purge với tombstones~~.
++- Key rotation và retention/purge đã triển khai ở v0.4; chưa có chunk/resume.
 - Chưa malware scan, redaction, OCR, video transcoding hoặc NAS/ARM64 nghiệm thu.
 - Review UI giữ nguyên source list; public correction/version linkage còn thiếu.
 - Backup không mã hóa. `.hsd.json` **không** chứa credentials/connectors/outbox/intake/
@@ -150,15 +151,14 @@ Không tự xóa volume hoặc sử dụng `down -v` trên instance không phả
 
 ## 8. Điểm tiếp quản đề xuất
 
-Ưu tiên kế tiếp: **retention/purge và key rotation cho community alpha**. Hiện intake
-có trần lưu giữ nhưng chưa có luồng purge, nên chưa phù hợp vận hành dài hạn.
+Ưu tiên kế tiếp: **luồng đính chính/public version linkage và chỉnh nguồn trong review UI**.
+Key rotation và purge đã xong ở v0.4; tiếp theo là cải thiện quy trình biên tập công bố.
 
-Tiêu chí cần thỏa nếu task này được chọn:
-1. Purge được cho trạng thái được phép, không làm lộ private metadata.
-2. Giữ idempotency tombstone: retry gói đã purge không vô tình tạo bản mới/công bố lại.
-3. Rotation giữ contributor identity và receipt ownership, thu hồi khóa cũ có kiểm thử.
-4. Audit/backup/restore phản ánh đúng lifecycle mới; không tự xóa archive người dùng.
-5. Có test hai instance và docs giới hạn/tương thích trước khi đổi maturity.
+Tiêu chí cho task kế tiếp:
+1. Đính chính tạo phiên bản công bố mới liên kết với bản cũ, không ghi đè.
+2. Reviewer chỉnh nguồn trong review UI, giữ audit trail.
+3. Public reader hiển thị lịch sử đính chính.
+4. Test hai instance và docs giới hạn/tương thích.
 
 Task khác vẫn có thể được ưu tiên theo chỉ đạo người dùng; đây không phải danh sách
 việc AI tự làm toàn bộ. Khi bàn giao, cập nhật checkpoint và next action ở file này.

@@ -25,14 +25,13 @@ async function instance(t, mode = 'local') {
 async function pair(t) {
   const local = await instance(t), remote = await instance(t, 'community');
   const key = await remote.ok('/community/keys', 'POST', { label: 'Fixture contributor' });
-  const connection = await local.ok('/connectors', 'POST', { label: 'Fixture receiver', origin: remote.origin(), publicOrigin: remote.origin(), secret: key.secret });
-  const row = await local.ok('/records', 'POST', { title: 'Selected case', summary: 'Public summary', body: 'PRIVATE BODY NEVER SENT', sources: [{ title: 'PRIVATE SOURCE', note: 'private note' }] });
+  const connection = await local.ok('/connectors', 'POST', { label: 'Fixture receiver', origin: remote.origin(), publicOrigin: remote.origin(), secret: key.secret });  const row = await local.ok('/records', 'POST', { title: 'Selected case', summary: 'Public summary', body: 'PRIVATE BODY NEVER SENT', sources: [{ title: 'PRIVATE SOURCE', note: 'private note' }] });
   const selected = await local.ok(`/records/${row.id}/attachments?name=selected.txt`, 'POST', Buffer.from('selected bytes'), { raw: true });
   const privateFile = await local.ok(`/records/${row.id}/attachments?name=private.txt`, 'POST', Buffer.from('PRIVATE FILE NEVER SENT'), { raw: true });
   const detail = await local.ok(`/records/${row.id}`);
   const prepare = () => local.ok('/outbox/prepare', 'POST', { connectorId: connection.id, recordId: row.id, revision: detail.revision, attachmentIds: [selected.id], includeBody: false, includeSources: false, credit: 'Voluntary credit', rights: 'Fictional fixture owned by test contributor.' });
   const send = draft => local.ok(`/outbox/${draft.id}/send`, 'POST', { confirm: true, hash: draft.hash });
-  return { local, remote, key, connection, row, selected, privateFile, detail, prepare, send };
+  return { local, remote, key, contributorId: key.contributorId, connection, row, selected, privateFile, detail, prepare, send };
 }
 function wire(remote, key, path, method = 'GET', body, extra = {}) {
   return fetch(`${remote.origin()}/api${path}`, { method, headers: { Authorization: `Bearer ${key.secret}`, ...(body ? { 'Content-Type': 'application/json' } : {}), ...extra }, body: body ? JSON.stringify(body) : undefined });

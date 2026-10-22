@@ -30,7 +30,8 @@ data loss, export it and restore it on another instance. No central account need
 - [ ] Community mode: PostgreSQL, object storage, OTP email and roles.
 - [x] Selective immutable packages, preview and explicit send confirmation.
 - [x] Bearer-key intake, manifest/hash validation and idempotent whole-package retry.
-- [ ] Resumable uploads, key rotation and production retention/purge.
+- [x] Resumable uploads, key rotation and production retention/purge.
++- [x] Key rotation preserving contributor identity; manual and retention-based purge with tombstones.
 - [x] Private single-admin review, change requests/reject/approve, separate publish/withdraw.
 - [ ] Multi-reviewer workflow, appeals and linked public correction versions.
 - [x] Explicit status refresh and public link without overwriting local records.
